@@ -179,12 +179,30 @@
  * before the following callback is sent. DARWIN_DCP_IOMFB_CB_AFTER names
  * what starts the script. Every line is prefixed "iomfb:", which
  * tools/probe.sh filters on.
+ *
+ * DARWIN_DCP_IOMFB_HOTPLUG=1 turns on a native one-shot producer for the
+ * D575 hot-plug-detect callback: once the AP's A389 display query has been
+ * answered (A389 is RPC #4 at IOMFB bring-up; A385 polling
+ * starts too late, after backboardd's HPD registration) and a further DARWIN_DCP_IOMFB_HOTPLUG_DELAY seconds (default
+ * 30) of guest time have passed, the model sends a single D575 (event 1,
+ * trailing bool 1, optional structure suppressed) through the same
+ * callback transport as the scripted harness. The packet shape is the
+ * one the guest's D575 handler declares -- in_len 0x58, out_len 0x4c,
+ * event u64 at +0, bool at +0x53, optional-structure flag at +0x54 --
+ * read out of the handler at 0xfffffff00a1964e4 and the latch it drives
+ * (IOMobileFramebufferAP::hotPlug_notify_gated, 0xfffffff00a178c04) in
+ * the iOS 27.0.1 (24A446) kernelcache; the fork's 24A5430a decode in
+ * docs/re/iomfb-hotplug-swap-gate.md agrees field for field. A real DCP
+ * raises hot-plug detect when its display pipeline comes up; this model
+ * has no other source for the event, so the producer is opt-in and
+ * one-shot, with a fail latch instead of retries.
  */
 
 #include "qemu/osdep.h"
 #include "xnu/darwin_fb.h"
 #include "qapi/error.h"
 #include "migration/vmstate.h"
+#include "qemu/timer.h"
 #include "hw/arm/darwin_iomfb_swap.h"
 #include "system/memory.h"
 #include "system/address-spaces.h"
@@ -252,6 +270,16 @@ struct DarwinIOMFB {
     bool debug;
     bool rpc_trace;
 
+    /*
+     * Structured DCP event trace (DARWIN_DCP_TRACE=/path). One CSV row per
+     * RPC request ('R') and completion ('C'): guest-virtual timestamp (ns),
+     * FourCC, endpoint, in/out lengths, note. This complements the stderr
+     * logs; it never replaces them. The file is opened append-mode and a
+     * header row is written when the file is new or empty.
+     */
+    FILE *dcp_event_fp;
+    uint64_t dcp_event_n;
+
     /* The AP's shared heap, from the class-0/subkind-1 announce. */
     bool heap_known;
     uint64_t heap_dva;
@@ -316,6 +344,25 @@ struct DarwinIOMFB {
     /* A408 remains outstanding until its same-slot D594 returns. */
     bool swap_nested[IOMFB_TAGS];
     uint32_t swap_nested_ids[IOMFB_TAGS];
+
+    /*
+     * Opt-in native one-shot D575 hot-plug-detect producer
+     * (DARWIN_DCP_IOMFB_HOTPLUG). Armed when the first A389 display
+     * query is answered (early; see above); the delay then gives WindowServer's bring-up
+     * time to register its kernel hot-plug listeners before the event
+     * lands (the kernel also pends the event if no listener has
+     * registered yet, so landing early is not fatal). sent/active
+     * track the single attempt; a failed send or a non-zero completion
+     * status latches hotplug_failed instead of retrying.
+     */
+    bool hotplug_enabled;
+    unsigned hotplug_delay_sec;
+    bool hotplug_armed;
+    bool hotplug_sent;
+    bool hotplug_active;
+    bool hotplug_failed;
+    uint8_t hotplug_ep;
+    QEMUTimer *hotplug_timer;
 };
 
 static int darwin_iomfb_post_load(void *opaque, int version_id)
@@ -323,7 +370,8 @@ static int darwin_iomfb_post_load(void *opaque, int version_id)
     DarwinIOMFB *m = opaque;
 
     if ((m->cb_next || m->cb_started ||
-         (m->cb_busy && !m->swap_active)) && !m->cb_script) {
+         (m->cb_busy && !m->swap_active && !m->hotplug_active)) &&
+        !m->cb_script && !m->hotplug_enabled) {
         return -EINVAL;
     }
     if (m->cb_script && m->cb_next > m->cb_script->len) {
@@ -400,6 +448,55 @@ static const VMStateDescription vmstate_iomfb_nested = {
     },
 };
 
+static void iomfb_hotplug_timer_cb(void *opaque);
+
+static bool iomfb_hotplug_state_needed(void *opaque)
+{
+    DarwinIOMFB *m = opaque;
+    return m->hotplug_armed || m->hotplug_sent || m->hotplug_active ||
+           m->hotplug_failed;
+}
+
+static int iomfb_hotplug_post_load(void *opaque, int version_id)
+{
+    DarwinIOMFB *m = opaque;
+    if (!m->hotplug_enabled || (m->hotplug_active && !m->cb_busy)) {
+        return -EINVAL;
+    }
+    if (m->hotplug_armed && !m->hotplug_sent && !m->hotplug_failed) {
+        /*
+         * The QEMUTimer is not part of the migrated state, so a snapshot
+         * restore would otherwise leave the one-shot producer permanently
+         * silent. Re-create and re-arm it; the D575 then fires
+         * hotplug_delay_sec after the restore, exactly as on a fresh boot.
+         */
+        m->hotplug_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                        iomfb_hotplug_timer_cb, m);
+        timer_mod(m->hotplug_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                  (int64_t)m->hotplug_delay_sec * 1000);
+        fprintf(stderr, "iomfb: D575 hot-plug-detect timer re-armed post-load"
+                " (+%u s)\n", m->hotplug_delay_sec);
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_iomfb_hotplug = {
+    .name = "darwin-iomfb/hotplug-detect",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = iomfb_hotplug_state_needed,
+    .post_load = iomfb_hotplug_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(hotplug_armed, DarwinIOMFB),
+        VMSTATE_BOOL(hotplug_sent, DarwinIOMFB),
+        VMSTATE_BOOL(hotplug_active, DarwinIOMFB),
+        VMSTATE_BOOL(hotplug_failed, DarwinIOMFB),
+        VMSTATE_UINT8(hotplug_ep, DarwinIOMFB),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_darwin_iomfb = {
     .name = "darwin-iomfb",
     .version_id = 1,
@@ -421,6 +518,7 @@ static const VMStateDescription vmstate_darwin_iomfb = {
     .subsections = (const VMStateDescription * const[]) {
         &vmstate_iomfb_swap,
         &vmstate_iomfb_nested,
+        &vmstate_iomfb_hotplug,
         NULL
     },
 };
@@ -706,6 +804,51 @@ static void iomfb_parse_overrides(DarwinIOMFB *m, const char *spec) {
     }
 }
 
+/* -------------------------------------------- structured event trace -- */
+
+/*
+ * Structured DCP event trace, DARWIN_DCP_TRACE=/path. One CSV row per event:
+ *   t_ns,dir,fourcc,ep,in_len,out_len,note
+ * t_ns is QEMU_CLOCK_VIRTUAL (guest time) in nanoseconds. dir is R (AP->DCP
+ * RPC request), C (DCP->AP RPC completion), or M (other mailbox control
+ * message). fourcc is the 4-char RPC name, "-" for control messages. note
+ * carries the completion answer mode ("zeroed", "PROBE override",
+ * "built-in A489") or "nested" for callback-context requests. Buffered
+ * (64 KiB) with a flush every 1024 events so a crashed guest still leaves a
+ * usable trace.
+ */
+static void iomfb_dcp_event(DarwinIOMFB *m, char dir, const char *fourcc,
+                            uint8_t ep, uint32_t in_len, uint32_t out_len,
+                            const char *note)
+{
+    FILE *fp = m->dcp_event_fp;
+    if (!fp) {
+        return;
+    }
+    fprintf(fp, "%" PRIu64 ",%c,%s,%u,%u,%u,%s\n",
+            (uint64_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+            dir, fourcc, ep, in_len, out_len, note ? note : "");
+    if ((++m->dcp_event_n & 1023) == 0) {
+        fflush(fp);
+    }
+}
+
+static void iomfb_dcp_event_open(DarwinIOMFB *m, const char *path)
+{
+    FILE *fp = fopen(path, "a");
+    if (!fp) {
+        fprintf(stderr, "iomfb: DARWIN_DCP_TRACE: cannot open '%s': %s; "
+                "structured trace disabled\n", path, strerror(errno));
+        return;
+    }
+    if (ftell(fp) == 0) {
+        fprintf(fp, "t_ns,dir,fourcc,ep,in_len,out_len,note\n");
+    }
+    setvbuf(fp, NULL, _IOFBF, 64 * 1024);
+    m->dcp_event_fp = fp;
+    fprintf(stderr, "iomfb: structured DCP event trace enabled: %s\n", path);
+}
+
 /* -------------------------------------------------------------- sending -- */
 
 static void iomfb_send(DarwinIOMFB *m, uint8_t ep, uint64_t msg, const char *what) {
@@ -889,6 +1032,69 @@ static void iomfb_swap_enqueue(DarwinIOMFB *m, const uint8_t *input,
     m->swap_count++;
 }
 
+/*
+ * The D575 hot-plug-detect input, as the guest handler declares it
+ * (0xfffffff00a1964e4 in the 24A446 kernelcache): a u64 event code at
+ * +0 (1 = display attached), the trailing bool at +0x53, and the
+ * optional-structure flag at +0x54. Setting the flag makes the handler
+ * pass NULL for the optional IOMFB_TiledDisplayInfo argument, which
+ * the hot-plug target does not read (hotPlug_notify_gated consumes
+ * only the event and the bool), so the AP never dereferences it.
+ */
+#define IOMFB_HOTPLUG_IN_LEN  0x58
+#define IOMFB_HOTPLUG_OUT_LEN 0x4c
+
+static void iomfb_hotplug_try_send(DarwinIOMFB *m)
+{
+    uint8_t input[IOMFB_HOTPLUG_IN_LEN] = { 0 };
+    IOMFBCallback cb = { .name = "D575", .name_be = 0x44353735,
+                         .out_len = IOMFB_HOTPLUG_OUT_LEN };
+
+    if (!m->hotplug_enabled || !m->hotplug_armed || m->hotplug_sent ||
+        m->hotplug_failed || m->cb_busy) {
+        return;
+    }
+    if (m->cb_script && m->cb_next < m->cb_script->len) {
+        return;                 /* let the experiment script finish first */
+    }
+    if (!m->heap_known) {
+        m->hotplug_failed = true;
+        fprintf(stderr, "iomfb: D575 hot-plug-detect: the AP has not "
+                "announced its heap; producer stopped\n");
+        return;
+    }
+
+    input[0] = 1;               /* event u64 at +0: display attached */
+    input[0x53] = 1;            /* trailing bool at +0x53 */
+    input[0x54] = 1;            /* at +0x54: no optional structure */
+    cb.in = g_byte_array_new_take(g_memdup2(input, sizeof(input)),
+                                  sizeof(input));
+    m->hotplug_sent = true;
+    m->hotplug_active = iomfb_callback_send(m, m->hotplug_ep, &cb);
+    g_byte_array_unref(cb.in);
+    if (!m->hotplug_active) {
+        m->hotplug_failed = true;
+        fprintf(stderr, "iomfb: D575 hot-plug-detect could not be sent; "
+                "producer stopped\n");
+        return;
+    }
+    fprintf(stderr, "iomfb: D575 hot-plug-detect sent (event 1, bool 1, "
+            "no optional structure)\n");
+}
+
+static void iomfb_hotplug_timer_cb(void *opaque)
+{
+    DarwinIOMFB *m = opaque;
+
+    fprintf(stderr, "iomfb: hot-plug-detect delay elapsed; sending D575\n");
+    iomfb_hotplug_try_send(m);
+    if (!m->hotplug_sent && !m->hotplug_failed) {
+        /* The callback slot or the experiment script was busy; retry. */
+        timer_mod(m->hotplug_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 2000);
+    }
+}
+
 /* Send the next scripted callback, if any and if none is outstanding. */
 static void iomfb_callback_pump(DarwinIOMFB *m, uint8_t ep)
 {
@@ -939,6 +1145,17 @@ static void iomfb_callback_barrier(DarwinIOMFB *m, uint8_t ep,
 /* Run script gates only once the AP RPC has actually completed. */
 static void iomfb_after_rpc(DarwinIOMFB *m, uint8_t ep, const char name[5])
 {
+    if (m->hotplug_enabled && !m->hotplug_armed && !strcmp(name, "A389")) {
+        m->hotplug_armed = true;
+        m->hotplug_ep = ep;
+        m->hotplug_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                        iomfb_hotplug_timer_cb, m);
+        timer_mod(m->hotplug_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                  (int64_t)m->hotplug_delay_sec * 1000);
+        fprintf(stderr, "iomfb: first A389 answered; D575 hot-plug-detect "
+                "armed for +%u s\n", m->hotplug_delay_sec);
+    }
     iomfb_callback_barrier(m, ep, name);
     if (m->cb_script && !m->cb_started && m->cb_after && *m->cb_after &&
         !strcmp(name, m->cb_after)) {
@@ -960,6 +1177,33 @@ static void iomfb_callback_done(DarwinIOMFB *m, uint8_t ep, uint64_t msg)
     const unsigned tag = 0;
     uint32_t status = (uint32_t)(msg >> 16);
 
+    if (m->hotplug_active) {
+        m->cb_busy = m->hotplug_active = false;
+        fprintf(stderr, "iomfb: D575 hot-plug-detect completed, status "
+                "0x%x\n", status);
+        if (status) {
+            m->hotplug_failed = true;
+            fprintf(stderr, "iomfb: D575 hot-plug-detect rejected; "
+                    "producer stopped\n");
+            return;
+        }
+        uint64_t dva = m->heap_dva + IOMFB_CB_REQ_BASE
+                     + (uint64_t)tag * IOMFB_WINDOW
+                     + sizeof(IOMFBRpcHdr) + IOMFB_HOTPLUG_IN_LEN;
+        g_autofree uint8_t *out = g_malloc0(IOMFB_HOTPLUG_OUT_LEN);
+        if (!iomfb_dma(m, dva, out, IOMFB_HOTPLUG_OUT_LEN, false)) {
+            fprintf(stderr, "iomfb:   D575 output at dva 0x%" PRIx64
+                    " could not be read\n", dva);
+        } else {
+            g_autoptr(GString) hex = g_string_new(NULL);
+            for (uint32_t i = 0; i < 32; i++) {
+                g_string_append_printf(hex, "%02x", out[i]);
+            }
+            fprintf(stderr, "iomfb:   D575 out: %s...\n", hex->str);
+        }
+        iomfb_callback_pump(m, ep);
+        return;
+    }
     if (m->swap_active) {
         fprintf(stderr, "iomfb: swap id %u D594 completed, status 0x%x\n",
                 m->swap_ids[m->swap_head], status);
@@ -971,6 +1215,7 @@ static void iomfb_callback_done(DarwinIOMFB *m, uint8_t ep, uint64_t msg)
         m->swap_head = (m->swap_head + 1) % IOMFB_SWAP_QUEUE_SIZE;
         m->swap_count--;
         iomfb_callback_pump(m, ep);
+        iomfb_hotplug_try_send(m);
         return;
     }
     const IOMFBCallback *cb =
@@ -1003,6 +1248,7 @@ static void iomfb_callback_done(DarwinIOMFB *m, uint8_t ep, uint64_t msg)
     }
 
     iomfb_callback_pump(m, ep);
+    iomfb_hotplug_try_send(m);
 }
 
 /*
@@ -1148,6 +1394,7 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
             fprintf(stderr, "iomfb: swap id %u D594 nested completed, status "
                     "0x%x; releasing A408 tag %u\n",
                     m->swap_nested_ids[tag], status, tag);
+            iomfb_dcp_event(m, 'C', "A408", ep, 0, 0, "nested-D594");
             iomfb_send(m, ep, 0x42ULL | ((uint64_t)tag << 10) |
                        ((uint64_t)status << 16), "A408 after nested D594");
             iomfb_after_rpc(m, ep, "A408");
@@ -1253,6 +1500,8 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
             ep, nested ? "nested callback-context AP " : "", m->rpcs,
             name, h.name, h.in_len, h.out_len, off, size,
             IOMFB_TAG(msg), IOMFB_ACK(msg), IOMFB_FLAG9(msg));
+    iomfb_dcp_event(m, 'R', name, ep, h.in_len, h.out_len,
+                    nested ? "nested" : "");
 
     if (m->rpc_trace) {
         /*
@@ -1329,6 +1578,20 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
         if (ov) {
             memcpy(out, ov->data, MIN(ov->len, h.out_len));
             how = "PROBE override";
+        } else if (h.name == 0x41343839) {
+            /*
+             * Built-in A489 answer. The kernel issues A489 and keeps
+             * bit 0 of the first response byte as the display provider's
+             * [0x389] (0xfffffff00a188a90: ldurb; and w0, w8, #1; strb).
+             * The hot-plug latch [0x38a] is stored only when [0x389] is 1
+             * (hotPlug_notify_gated, 0xfffffff00a178c94-0xa178cb8), and the
+             * mode query returns [0x38a] & 1 (selector 0x19,
+             * 0xfffffff00a176eb4). Bit 0 set is therefore required for the
+             * panel to activate; only bit 0 is consumed, the rest stays 0.
+             * A PROBE override still wins when present.
+             */
+            out[0] = 0x01;
+            how = "built-in A489";
         }
         uint64_t out_dva = win + off + sizeof(h) + h.in_len;
         if (!iomfb_dma(m, out_dva, out, h.out_len, true)) {
@@ -1364,6 +1627,7 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
                    | ((uint64_t)IOMFB_TAG(msg) << 10);
     char what[96];
     snprintf(what, sizeof(what), "class-2 completion for '%s', status 0, out %s", name, how);
+    iomfb_dcp_event(m, 'C', name, ep, h.in_len, h.out_len, how);
     iomfb_send(m, ep, reply, what);
 
     /* Legacy callback-context A408 handling; normal ack-0 submissions use
@@ -1388,6 +1652,10 @@ bool darwin_iomfb_handle(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
             " | class %u subkind %u ack %u flag9 %u tag %u payload 0x%" PRIx64 "\n",
             ep, msg, cls, IOMFB_SUBKIND(msg), IOMFB_ACK(msg), IOMFB_FLAG9(msg),
             IOMFB_TAG(msg), msg >> 16);
+
+    if (cls != 2) {
+        iomfb_dcp_event(m, 'M', "-", ep, 0, 0, "");
+    }
 
     if (m->level < 2) {
         return true;    /* decode-only mode: never answer */
@@ -1439,6 +1707,26 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
     if (m->swap_enabled) {
         fprintf(stderr, "iomfb: native A408/D594 swap completion enabled\n");
     }
+    const char *hotplug = getenv("DARWIN_DCP_IOMFB_HOTPLUG");
+    m->hotplug_enabled = level >= 3 && hotplug && !strcmp(hotplug, "1");
+    m->hotplug_delay_sec = 30;
+    const char *hpdelay = getenv("DARWIN_DCP_IOMFB_HOTPLUG_DELAY");
+    if (hpdelay && *hpdelay) {
+        char *end = NULL;
+        unsigned long v = strtoul(hpdelay, &end, 0);
+        if (end != hpdelay && !*end && v <= 3600) {
+            m->hotplug_delay_sec = (unsigned)v;
+        } else {
+            fprintf(stderr, "iomfb: DARWIN_DCP_IOMFB_HOTPLUG_DELAY '%s' "
+                    "is not a number of seconds (0-3600); using %u\n",
+                    hpdelay, m->hotplug_delay_sec);
+        }
+    }
+    if (m->hotplug_enabled) {
+        fprintf(stderr, "iomfb: native one-shot D575 hot-plug-detect "
+                "producer enabled (%u s after the first A389)\n",
+                m->hotplug_delay_sec);
+    }
     m->debug = dbg && dbg[0] && dbg[0] != '0';
     m->rpc_trace = trace && trace[0] && trace[0] != '0';
     if (m->rpc_trace) {
@@ -1447,6 +1735,11 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
                                                   g_free);
         fprintf(stderr, "iomfb: TRACE AP->DCP RPC tracing enabled by "
                 "DARWIN_DCP_IOMFB_RPC_TRACE\n");
+    }
+
+    const char *dcp_trace = getenv("DARWIN_DCP_TRACE");
+    if (dcp_trace && *dcp_trace) {
+        iomfb_dcp_event_open(m, dcp_trace);
     }
 
     if (level >= 4) {

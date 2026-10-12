@@ -109,6 +109,7 @@ typedef struct DarwinDCP {
     /* announce policy, resolved once at create time */
     bool announce;          /* DARWIN_DCP_EPIC != "off" */
     bool announce_all;      /* DARWIN_DCP_EPIC == "all" */
+    bool announce_dcpexpert; /* announce the DCP expert's interface too */
     const char *only;       /* a single EPICName, or NULL */
     uint8_t announce_ep;    /* which endpoint to announce on */
     uint8_t options;        /* EPIC packet header options byte */
@@ -277,6 +278,53 @@ static bool dcp_announce(DarwinDCP *d, uint8_t ep, const DCPService *svc) {
     return ok;
 }
 
+/*
+ * The DCP expert's endpoint interface.
+ *
+ * No EPICName personality matches this service -- the kernelcache has
+ * none for it. AppleDCPExpert finds it by name instead: when the device
+ * tree reports a remote power state, its start() registers a
+ * service-interest notification for a service named "dcpexpert-service"
+ * whose "role" property equals the role from its own device-tree node
+ * ("DCP"), and waits for the AFK layer to hand it the interface
+ * (kc 0xfffffff008a2bbdc). This publish is what creates that service:
+ * the frame name and the "name"/"interface-name" properties are what
+ * the nub is named from, and "role" rides along as a plain registry
+ * property, which is all the expert's property match looks at.
+ * "dcpexpert-epic" is the name the firmware keeps for the service
+ * (dcpfw+0x3e8180); nothing on the AP matches on it.
+ */
+static bool dcp_announce_dcpexpert(DarwinDCP *d, uint8_t ep) {
+    const DarwinEpicProp props[] = {
+        { .key = "EPICName",       .str = "dcpexpert-epic" },
+        { .key = "EPICUnit",       .num = 0, .bits = 64 },
+        { .key = "name",           .str = "dcpexpert-service" },
+        { .key = "interface-name", .str = "dcpexpert-service" },
+        { .key = "role",           .str = "DCP" },
+    };
+    size_t plen = 0;
+    g_autofree uint8_t *blob = darwin_epic_serialize_props(props, ARRAY_SIZE(props), &plen);
+
+    uint16_t iface = d->next_iface++;
+    size_t flen = 0;
+    g_autofree uint8_t *frame =
+        darwin_epic_build_publish(iface, "dcpexpert-service", blob, plen, d->options, &flen);
+
+    bool ok = darwin_afk_send_qe(d->afk, ep, 0, 0, frame, (uint32_t)flen, false);
+    fprintf(stderr, "dcp: ep 0x%02x announce name=dcpexpert-service EPICName=dcpexpert-epic "
+            "iface-id %u frame 0x%zx bytes (props 0x%zx) -> %s\n",
+            ep, iface, flen, plen, ok ? "queued" : "FAILED (ring full, or DMA unreachable)");
+
+    if (getenv("DARWIN_AFK_DEBUG")) {
+        g_autoptr(GString) s = g_string_new(NULL);
+        for (size_t i = 0; i < flen; i++) {
+            g_string_append_printf(s, "%s%02x", (i && !(i & 15)) ? "\n dcp:   " : " ", frame[i]);
+        }
+        fprintf(stderr, "dcp:   %s\n", s->str);
+    }
+    return ok;
+}
+
 static void dcp_afk_started(void *opaque, uint8_t ep) {
     DarwinDCP *d = opaque;
 
@@ -309,9 +357,14 @@ static void dcp_afk_started(void *opaque, uint8_t ep) {
      * traffic of its own accord, so it is the cheapest way to prove that a
      * driver really bound rather than merely that a nub appeared.
      */
-    if (!any && d->only) {
+    if (!any && d->only && !d->announce_dcpexpert) {
         DCPService synth = { d->only, d->only };
         any = dcp_announce(d, ep, &synth);
+    }
+    if (d->announce_dcpexpert) {
+        if (dcp_announce_dcpexpert(d, ep)) {
+            any = true;
+        }
     }
     /*
      * One RBEP_RECV for the whole burst. RECV carries the new wptr and the AP
@@ -464,6 +517,8 @@ DeviceState *darwin_dcp_create(struct dtree_node *dt_root, uint64_t iobase, Devi
     if ((env = getenv("DARWIN_DCP_EPIC_OPTIONS"))) {
         d->options = (uint8_t)strtoul(env, NULL, 0);
     }
+    d->announce_dcpexpert = d->announce &&
+        (!d->only || !strcmp(d->only, "dcpexpert-service"));
     d->next_iface = 1;
 
     memcpy(dcp_eps_adv, dcp_eps, sizeof(dcp_eps));

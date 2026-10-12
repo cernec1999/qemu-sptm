@@ -252,6 +252,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(DarwinANSState, DARWIN_ANS)
 /* Tunnel sub-command at args+0xc; see ans_admin(). */
 #define ANS_TUNNEL_SET_TIME   6
 
+/* Apple NVRAM namespace. AppleEmbeddedNVMeNVRAM uses a hardcoded NSID 255
+ * (not one of the DT-listed namespaces) for its 8192-byte NVRAM region:
+ * restore issues READ nsid 255, LBA 0, 2 blocks (2 x 4096 = 8192).
+ * Backed by a small in-memory buffer, zero-initialized (fresh NVRAM). */
+#define ANS_NVRAM_NSID 255
+#define ANS_NVRAM_SIZE 8192
+
 /* NVMe IO opcodes */
 #define NVME_IO_FLUSH       0x00
 #define NVME_IO_WRITE       0x01
@@ -334,6 +341,7 @@ struct DarwinANSState {
     uint32_t num_sl;            /* "nvme-num-sl" */
     uint32_t sl_idle_status;    /* what SL_STATUS reads; see ans_aux_read() */
     uint32_t nsid;              /* namespace we back with the block device */
+    uint8_t nvram[ANS_NVRAM_SIZE]; /* NVRAM namespace (nsid 255) backing */
     uint32_t lba_size;
     uint32_t sqe_stride;
     uint32_t mdts;
@@ -696,6 +704,16 @@ static void ans_identify_ctrl(DarwinANSState *s, uint8_t *buf)
 static void ans_identify_ns(DarwinANSState *s, uint32_t nsid, uint8_t *buf)
 {
     memset(buf, 0, ANS_IDENTIFY_SIZE);
+    if (nsid == ANS_NVRAM_NSID) {
+        /* NVRAM namespace: ANS_NVRAM_SIZE bytes. Report in LBAs. */
+        uint64_t nlb = ANS_NVRAM_SIZE / s->lba_size;
+        stq_le_p(buf + 0x00, nlb);             /* NSZE */
+        stq_le_p(buf + 0x08, nlb);             /* NCAP */
+        stq_le_p(buf + 0x10, nlb);             /* NUSE */
+        /* LBAF0: MS=0, LBADS=log2(lba_size), RP=0 */
+        stl_le_p(buf + 0x80, (uint32_t)ctz32(s->lba_size) << 16);
+        return;
+    }
     if (nsid != s->nsid || !s->blk) {
         /* NVMe 1.4 6.1.5: an inactive NSID returns all zeroes, which is how
          * the driver learns the namespace is not there. */
@@ -1017,6 +1035,33 @@ static uint16_t ans_io_command(DarwinANSState *s, const ANSCmd *c, uint32_t *res
         ans_log(s, "io opcode 0x%02x with no block backend attached; "
                 "pass -drive if=none,id=ans,file=...\n", c->opcode);
         return NVME_SC_INTERNAL;
+    }
+    if (c->nsid == ANS_NVRAM_NSID) {
+        /* NVRAM namespace: bounds-checked access to the in-memory buffer.
+         * Reads return the stored bytes (zeroed when fresh); writes persist
+         * for the life of the VM. This is what a real device with empty
+         * NVRAM does, minus the flash wear. */
+        uint64_t slba = ((uint64_t)c->cdw11 << 32) | c->cdw10;
+        uint32_t nlb = (c->cdw12 & 0xffff) + 1;
+        uint64_t off = slba * s->lba_size;
+        uint64_t len = (uint64_t)nlb * s->lba_size;
+        if (off + len > ANS_NVRAM_SIZE) {
+            ans_log(s, "NVRAM nsid 255: slba %" PRIu64 " nlb %u runs past %u bytes\n",
+                    slba, nlb, ANS_NVRAM_SIZE);
+            return NVME_SC_LBA_RANGE;
+        }
+        if (is_wz) {
+            memset(s->nvram + off, 0, len);
+        } else if (is_write) {
+            if (!ans_prp_rw(s, c->prp1, c->prp2, s->nvram + off, len, false)) {
+                return NVME_SC_DATA_XFER_ERR;
+            }
+        } else { /* is_read */
+            if (!ans_prp_rw(s, c->prp1, c->prp2, s->nvram + off, len, true)) {
+                return NVME_SC_DATA_XFER_ERR;
+            }
+        }
+        return NVME_SC_SUCCESS;
     }
     if (c->nsid != s->nsid) {
         return NVME_SC_INVALID_NS;
@@ -1986,6 +2031,7 @@ static const VMStateDescription vmstate_darwin_ans = {
         VMSTATE_UINT32_EQUAL(num_sl, DarwinANSState),
         VMSTATE_UINT32_EQUAL(sl_idle_status, DarwinANSState),
         VMSTATE_UINT32_EQUAL(nsid, DarwinANSState),
+        VMSTATE_BUFFER(nvram, DarwinANSState),
         VMSTATE_UINT32_EQUAL(lba_size, DarwinANSState),
         VMSTATE_UINT32_EQUAL(sqe_stride, DarwinANSState),
         VMSTATE_UINT32_EQUAL(mdts, DarwinANSState),
