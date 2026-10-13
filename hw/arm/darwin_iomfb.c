@@ -1054,9 +1054,6 @@ static void iomfb_hotplug_try_send(DarwinIOMFB *m)
         m->hotplug_failed || m->cb_busy) {
         return;
     }
-    if (m->cb_script && m->cb_next < m->cb_script->len) {
-        return;                 /* let the experiment script finish first */
-    }
     if (!m->heap_known) {
         m->hotplug_failed = true;
         fprintf(stderr, "iomfb: D575 hot-plug-detect: the AP has not "
@@ -1089,7 +1086,7 @@ static void iomfb_hotplug_timer_cb(void *opaque)
     fprintf(stderr, "iomfb: hot-plug-detect delay elapsed; sending D575\n");
     iomfb_hotplug_try_send(m);
     if (!m->hotplug_sent && !m->hotplug_failed) {
-        /* The callback slot or the experiment script was busy; retry. */
+        /* The callback slot was busy; retry. */
         timer_mod(m->hotplug_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 2000);
     }
