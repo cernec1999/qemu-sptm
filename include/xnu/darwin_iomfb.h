@@ -55,4 +55,9 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
 // an endpoint we advertise must never look dead, and never faults.
 bool darwin_iomfb_handle(DarwinIOMFB *m, uint8_t ep, uint64_t msg);
 
+// The DCP's RTKit link has been (re)established (the ASC handshake
+// completed). Lets the hot-plug-detect producer present the attach
+// again on the new link; a no-op unless that producer is enabled.
+void darwin_iomfb_link_up(DarwinIOMFB *m);
+
 void darwin_iomfb_register_vmstate(DarwinIOMFB *m, unsigned instance_id);

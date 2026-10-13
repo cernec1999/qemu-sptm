@@ -180,11 +180,11 @@
  * what starts the script. Every line is prefixed "iomfb:", which
  * tools/probe.sh filters on.
  *
- * DARWIN_DCP_IOMFB_HOTPLUG=1 turns on a native one-shot producer for the
+ * DARWIN_DCP_IOMFB_HOTPLUG=1 turns on a native producer for the
  * D575 hot-plug-detect callback: once the AP's A389 display query has been
  * answered (A389 is RPC #4 at IOMFB bring-up; A385 polling
  * starts too late, after backboardd's HPD registration) and a further DARWIN_DCP_IOMFB_HOTPLUG_DELAY seconds (default
- * 30) of guest time have passed, the model sends a single D575 (event 1,
+ * 30) of guest time have passed, the model sends a D575 (event 1,
  * trailing bool 1, optional structure suppressed) through the same
  * callback transport as the scripted harness. The packet shape is the
  * one the guest's D575 handler declares -- in_len 0x58, out_len 0x4c,
@@ -193,9 +193,11 @@
  * (IOMobileFramebufferAP::hotPlug_notify_gated, 0xfffffff00a178c04) in
  * the iOS 27.0.1 (24A446) kernelcache; the fork's 24A5430a decode in
  * docs/re/iomfb-hotplug-swap-gate.md agrees field for field. A real DCP
- * raises hot-plug detect when its display pipeline comes up; this model
- * has no other source for the event, so the producer is opt-in and
- * one-shot, with a fail latch instead of retries.
+ * raises hot-plug detect when its display pipeline comes up, and its
+ * pipeline comes up on every DCP boot, so after the first presentation
+ * the model presents the attach again each time the DCP link is
+ * re-established (darwin_iomfb_link_up). The producer is opt-in, with
+ * a fail latch instead of retries.
  */
 
 #include "qemu/osdep.h"
@@ -346,14 +348,16 @@ struct DarwinIOMFB {
     uint32_t swap_nested_ids[IOMFB_TAGS];
 
     /*
-     * Opt-in native one-shot D575 hot-plug-detect producer
+     * Opt-in native D575 hot-plug-detect producer
      * (DARWIN_DCP_IOMFB_HOTPLUG). Armed when the first A389 display
      * query is answered (early; see above); the delay then gives WindowServer's bring-up
      * time to register its kernel hot-plug listeners before the event
      * lands (the kernel also pends the event if no listener has
      * registered yet, so landing early is not fatal). sent/active
-     * track the single attempt; a failed send or a non-zero completion
-     * status latches hotplug_failed instead of retrying.
+     * track the presentation currently in flight; a failed send or a
+     * non-zero completion status latches hotplug_failed instead of
+     * retrying. Once a presentation has completed, the next DCP link
+     * establishment presents the attach again (darwin_iomfb_link_up).
      */
     bool hotplug_enabled;
     unsigned hotplug_delay_sec;
@@ -1090,6 +1094,34 @@ static void iomfb_hotplug_timer_cb(void *opaque)
         timer_mod(m->hotplug_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 2000);
     }
+}
+
+/*
+ * The DCP link has been (re)established: the ASC handshake completed.
+ * Hot-plug detect is a per-boot pipeline signal -- the DCP presents
+ * it when its display pipeline comes up, which is every DCP boot,
+ * not just the first -- so when a link comes up after a presentation
+ * has completed, present the attach again, shortly after the link is
+ * up. The first presentation is owned by the arming path in
+ * iomfb_after_rpc() and is not disturbed, and a presentation still
+ * in flight is left alone; with the producer disabled this is a
+ * no-op, so a boot without DCP restarts behaves exactly as before.
+ */
+void darwin_iomfb_link_up(DarwinIOMFB *m)
+{
+    if (!m->hotplug_enabled || !m->hotplug_armed || m->hotplug_failed ||
+        m->hotplug_active || !m->hotplug_sent) {
+        return;
+    }
+    m->hotplug_sent = false;
+    if (!m->hotplug_timer) {
+        m->hotplug_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                        iomfb_hotplug_timer_cb, m);
+    }
+    timer_mod(m->hotplug_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 2000);
+    fprintf(stderr, "iomfb: DCP link re-established; D575 hot-plug-detect "
+            "will be presented again (+2 s)\n");
 }
 
 /* Send the next scripted callback, if any and if none is outstanding. */

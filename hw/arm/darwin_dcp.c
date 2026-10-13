@@ -169,7 +169,11 @@ static uint8_t dcp_eps_adv[ARRAY_SIZE(dcp_eps) + 1];
 static unsigned dcp_eps_adv_n;
 
 static void dcp_started(void *opaque) {
+    DarwinDCP *d = opaque;
     fprintf(stderr, "dcp: coprocessor booted\n");
+    // darwin_asc_create() runs before the IOMFB link model, so tolerate
+    // a callback arriving during ASC realize.
+    if (d->iomfb) darwin_iomfb_link_up(d->iomfb);
 }
 
 static void dcp_ep_start(void *opaque, uint8_t ep, uint32_t flag) {
