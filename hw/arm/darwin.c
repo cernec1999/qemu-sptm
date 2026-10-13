@@ -30,6 +30,7 @@
 #include "xnu/darwin_dart.h"
 #include "xnu/darwin_sep.h"
 #include "xnu/darwin_ans.h"
+#include "xnu/darwin_smc.h"
 #include "xnu/darwin_unimp.h"
 #include "xnu/darwin_smp.h"
 #include "xnu/darwin_spmi.h"
@@ -407,6 +408,9 @@ static void darwin_init(MachineState *ms) {
     // The SEP is an ASC wrapper too, but speaks its own protocol above the
     // mailbox rather than RTKit, so it gets its own model (darwin_sep.c).
     darwin_sep_create(dt_root, iobase, aic);
+    // The SMC is an ASC wrapper too, with its key protocol modelled in
+    // darwin_smc.c; it claims "smc" below so the generic pass skips it.
+    darwin_smc_create(dt_root, iobase, aic);
     // Any other coprocessor left enabled in the device tree gets a bare
     // RTKit mailbox, so XNU's RTBuddy can attach and start it.
     // The ANS storage coprocessor owns its own /arm-io/ans mailbox as well as
@@ -420,7 +424,7 @@ static void darwin_init(MachineState *ms) {
     // already exist, so in that mode we create nothing and leave "ans"
     // unclaimed. Delete this branch, and the scaffold, once the guarded path
     // has been boot-tested. ("ans" must stay last in the array for this.)
-    static const char *const claimed_ascs[] = { "dcp", "sep", "ans" };
+    static const char *const claimed_ascs[] = { "dcp", "sep", "smc", "ans" };
     unsigned n_claimed = ARRAY_SIZE(claimed_ascs);
     if (getenv("DARWIN_ANS_SELFWIRE")) {
         n_claimed--;
